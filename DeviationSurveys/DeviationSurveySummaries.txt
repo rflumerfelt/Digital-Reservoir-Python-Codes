@@ -1,0 +1,230 @@
+import fme
+import fmeobjects
+import numpy as np
+from scipy import stats as sp
+import math
+
+
+class FeatureProcessor(object):
+
+#INITIALIZATION
+#----------------------------------------------------------------------------------------
+    def __init__(self):
+        global lstSurvey, dt
+        global inclination_lateral_start, max_dogleg_depth
+        
+        params = self.getParameters(['INCLINATION_LATERAL_START', 'DOGLEG_LATERAL_OFFSET'])
+        inclination_lateral_start = float(params['INCLINATION_LATERAL_START'])
+        max_dogleg_depth = float(params['DOGLEG_LATERAL_OFFSET'])
+        lstSurvey = []
+#INPUT
+#----------------------------------------------------------------------------------------
+    def input(self, feature):
+        global survey, wellid, surveyid
+        
+        wellid = feature.getAttribute('Well_ID')
+        surveyid = feature.getAttribute('Survey_ID')
+        md = feature.getAttribute('Measured_Depth')
+        tvd = feature.getAttribute('TVD')
+        incl = feature.getAttribute('Inclination')
+        ns = feature.getAttribute('N_S')
+        ew = feature.getAttribute('E_W')
+        dls = feature.getAttribute('Dog_Leg_Severity')
+        dist = feature.getAttribute('Distance_Projection')
+        lstSurvey.append([md, tvd, incl, ew, ns, dls, dist])
+
+    
+
+#PROCESS GROUP
+#----------------------------------------------------------------------------------------
+    def process_group(self):
+        global lstSurvey
+        
+        #Initialize Variables
+        idx = None
+        slope = None
+        intercept = None
+        se = None
+        azimuth = None
+        ys = None
+        ye = None
+        xs = None
+        xe = None
+        mdstart = None
+        avgtvd = None
+        maxdogleg = None
+        dse = None
+        dip = None
+        dslope = None
+        survey = np.array(lstSurvey, float)
+        np.sort(survey)
+        md = survey[:,0]
+        tvd = survey[:,1]
+        inclination = survey[:,2]
+        ew = survey[:,3]
+        ns = survey[:,4]
+        dls = survey[:,5]
+        dist = survey[:,6]
+        
+        #Wellbore Calculations
+        maxmd = md.max()
+        maxtvd = tvd.max()
+        #Lateral Calculations
+        arr=np.where(inclination > inclination_lateral_start)
+        if len(arr[0]) > 0:
+            idx = int(arr[0][0])
+            #LateralDepths
+            avgtvd=np.average(tvd[idx:])
+            avgtvd = self.replaceNan(avgtvd,None)
+            #Lateral Start
+            if idx==0:
+                mdstart = md[0]
+                xs = ew[0]
+                ys = ew[0]
+                maxdogleg = 0
+            else:
+                f = (inclination_lateral_start - inclination[idx-1]) / (inclination[idx]-inclination[idx-1])
+                mdstart = md[idx-1] + (md[idx]-md[idx-1]) * f
+                xs = ew[idx-1] + (ew[idx]-ew[idx-1]) * f
+                ys = ns[idx-1] + (ns[idx]-ns[idx-1]) * f
+                #Max Dogleg
+                doglegdepth = mdstart - max_dogleg_depth
+                arr=np.where(np.logical_and(md < doglegdepth, dls > 0))
+                if len(arr[0]) > 0:
+                    idl = int(arr[0][0])
+                    a = dls[:idl]
+                    maxdogleg = a.max()
+                else:
+                    maxdogleg = 0
+            #Azimuth, Dip, and Lateral Endpoints
+            if len(ns[idx:]) > 2 and len(ew[idx:]) > 2:
+                dy = ns[-1] - ys
+                dx = ew[-1] - xs
+                x1 = xs
+                y1 = ys
+                x2 = ew[-1]
+                y2 = ns[-1]
+                #N/S Wells
+                if abs(dy) > abs(dx):
+                    x = ns[idx:]
+                    y = ew[idx:]
+                    s, i, r, p, se = sp.linregress(x, y)
+                    #Typical N/S wells
+                    if abs(s) > 0.000001:
+                        slope = 1/s
+                        ys = (x1+y1/s - i) / (s + 1/s)
+                        ye = (x2+y2/s - i) / (s + 1/s)
+                        xs = s*ys + i
+                        xe = s*ye + i
+                        azimuth = math.atan(s) * 180. / math.pi
+                        if dy < 0:
+                            azimuth += 180
+                        if azimuth < 0:
+                            azimuth +=360
+                    #Due North N/S Wells
+                    else:
+                        ys=y1
+                        ye=y2
+                        xs = np.average(x)
+                        xe = np.average(y)
+                        slope = 10000
+                        azimuth = 0
+                        se = 0
+                #E/W Wells
+                else:
+                    x = ew[idx:]
+                    y = ns[idx:]
+                    slope, intercept, r, p, se = sp.linregress(x, y)
+                    azimuth = math.atan(slope) * 180. / math.pi
+                    if dx > 0:
+                        azimuth = 90 - azimuth
+                    else:
+                        azimuth = 270 - azimuth
+                    #Typical E/W wells
+                    if abs(slope) > 0.000001:
+                        xs = (y1+x1/slope - intercept) / (slope + 1/slope)
+                        xe = (y2+x2/slope - intercept) / (slope + 1/slope)
+                        ys = slope * xs + intercept
+                        ye = slope * xe + intercept
+                    #Due East/West Wells
+                    else:
+                        xs = x1
+                        xe = x2
+                        ys = intercept
+                        ye = intercept
+                        slope = None
+                #Dip
+                x = dist[idx:]
+                print(f'x: {x}')
+                print(f'y: {y}')
+                y = tvd[idx:]
+                sx = np.sum(x)
+                n = len(x)
+                ssx = np.sum(np.square(x))
+                if n*ssx - np.square(sx) < 0.00001:
+                    dslope = 99999
+                    dintercept = None
+                    a=sx/n
+                    dse = np.sqrt(np.square(np.sum(x-a)))/n
+                    dip = 0
+                else:
+                    dslope, dintercept, dr, dp, dse = sp.linregress(x, y)
+                    dip = math.atan(-dslope) * 180. / math.pi
+        #Vertical Wells
+        else:
+            se = None
+            xs = None
+            xe = None
+            ys = None
+            ye = None
+            dip = None
+            dslope = None
+            #Max Dogleg
+            if len (dls) > 0:
+                maxdogleg = dls.max()
+        #Output
+        feature = fmeobjects.FMEFeature()
+        feature.setAttribute('Slope',slope)
+        feature.setAttribute('Survey_ID',surveyid)
+        feature.setAttribute('Depth_Max_Md',maxmd)
+        feature.setAttribute('Depth_Avg_TVD',avgtvd)
+        feature.setAttribute('Depth_Max_TVD',maxtvd)
+        feature.setAttribute('IndexLateralStart',idx)
+        feature.setAttribute('Depth_Lateral_Start',mdstart)
+        feature.setAttribute('Intercept',intercept)
+        feature.setAttribute('Direction_Standard_Deviation',se)
+        feature.setAttribute('Elev_Standard_Deviation',dse)
+        feature.setAttribute('Azimuth',azimuth)
+        feature.setAttribute('Dip',dip)
+        feature.setAttribute('Elevation_Slope',dslope)
+        feature.setAttribute('Max_Vertical_Dog_Leg_Severity',maxdogleg)
+        feature.setAttribute('Lateral_Start_X',xs)
+        feature.setAttribute('Lateral_Start_Y',ys)
+        feature.setAttribute('Lateral_End_X',xe)
+        feature.setAttribute('Lateral_End_Y',ye)
+        
+        self.pyoutput(feature)
+
+        lstSurvey = []
+    
+    
+    def close(self):
+        pass
+    
+    def getParameters(self,ParameterNames):
+        ret = dict()
+        for macroName in FME_MacroValues:
+            for name in ParameterNames:
+                if name in str(macroName):
+                    ret[name] = FME_MacroValues[str(macroName)]
+                    break
+        return ret
+
+    def replaceNan(self,x, replacex):
+        print('--------enter ifnan')
+        if x == np.nan:
+            print('--------- if true')
+            return replacex
+        else:
+            return x
+            
